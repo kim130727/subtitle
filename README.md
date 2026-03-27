@@ -57,6 +57,7 @@ downloads/
 
 ```powershell
 python .\mp4_whisper.py
+uv run mp4_whisper.py
 ```
 
 ### 3) 결과 확인
