@@ -58,6 +58,7 @@ downloads/
 ```powershell
 python .\mp4_whisper.py
 uv run mp4_whisper.py
+uv add rich python-dotenv faster-whisper
 ```
 
 ### 3) 결과 확인

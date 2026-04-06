@@ -1,10 +1,27 @@
 from __future__ import annotations
 
 import json
+import os
+import re
 import subprocess
-import time
 from pathlib import Path
+
+from dotenv import load_dotenv
 from faster_whisper import WhisperModel
+from rich.console import Console
+from rich.progress import (
+    BarColumn,
+    Progress,
+    TaskProgressColumn,
+    TextColumn,
+    TimeElapsedColumn,
+    TimeRemainingColumn,
+)
+
+load_dotenv()
+
+# Hugging Face 관련 경고 완화
+os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
 
 
 def format_timestamp(seconds: float) -> str:
@@ -18,23 +35,85 @@ def format_timestamp(seconds: float) -> str:
     return f"{hours:02}:{minutes:02}:{secs:02},{ms:03}"
 
 
-def format_seconds(seconds: float) -> str:
-    seconds = max(0, int(seconds))
-    h = seconds // 3600
-    m = (seconds % 3600) // 60
-    s = seconds % 60
-    if h > 0:
-        return f"{h:d}:{m:02d}:{s:02d}"
-    return f"{m:02d}:{s:02d}"
+def normalize_text(text: str) -> str:
+    text = text.strip()
+    text = re.sub(r"\s+", " ", text)
+    text = re.sub(r"\s+([,.!?…])", r"\1", text)
+    text = re.sub(r"\(\s+", "(", text)
+    text = re.sub(r"\s+\)", ")", text)
+    text = re.sub(r"[·•▪■□]+", " ", text)
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
+
+
+def should_skip_segment(text: str, duration: float) -> bool:
+    cleaned = normalize_text(text)
+
+    if not cleaned:
+        return True
+
+    if len(cleaned) <= 1 and duration < 1.0:
+        return True
+
+    if re.fullmatch(r"[ㅋㅎㅠㅜ~.\-!?]+", cleaned):
+        return True
+
+    return False
+
+
+def merge_lines_for_txt(segments) -> list[str]:
+    lines: list[str] = []
+    buffer = ""
+
+    for seg in segments:
+        text = normalize_text(seg.text)
+        duration = max(0.0, float(seg.end - seg.start))
+
+        if should_skip_segment(text, duration):
+            continue
+
+        if not buffer:
+            buffer = text
+            continue
+
+        if buffer.endswith((".", "!", "?", "…")):
+            lines.append(buffer)
+            buffer = text
+            continue
+
+        if len(text) <= 12:
+            buffer += " " + text
+            continue
+
+        if len(buffer) <= 20:
+            buffer += " " + text
+            continue
+
+        lines.append(buffer)
+        buffer = text
+
+    if buffer:
+        lines.append(buffer)
+
+    cleaned_lines = []
+    for line in lines:
+        line = normalize_text(line)
+        if line:
+            cleaned_lines.append(line)
+
+    return cleaned_lines
 
 
 def write_srt(segments, output_path: Path) -> None:
     with output_path.open("w", encoding="utf-8-sig") as f:
         srt_index = 1
         for seg in segments:
-            text = seg.text.strip()
-            if not text:
+            text = normalize_text(seg.text)
+            duration = max(0.0, float(seg.end - seg.start))
+
+            if should_skip_segment(text, duration):
                 continue
+
             f.write(f"{srt_index}\n")
             f.write(f"{format_timestamp(seg.start)} --> {format_timestamp(seg.end)}\n")
             f.write(f"{text}\n\n")
@@ -42,11 +121,10 @@ def write_srt(segments, output_path: Path) -> None:
 
 
 def write_txt(segments, output_path: Path) -> None:
+    lines = merge_lines_for_txt(segments)
     with output_path.open("w", encoding="utf-8-sig") as f:
-        for seg in segments:
-            text = seg.text.strip()
-            if text:
-                f.write(text + "\n")
+        for line in lines:
+            f.write(line + "\n")
 
 
 def get_media_duration_seconds(file_path: Path) -> float:
@@ -69,64 +147,64 @@ def get_media_duration_seconds(file_path: Path) -> float:
     return float(data["format"]["duration"])
 
 
-def build_progress_bar(percent: int, width: int = 30) -> str:
-    filled = int(width * percent / 100)
-    return "█" * filled + "-" * (width - filled)
+def build_model() -> WhisperModel:
+    model_name = os.getenv("WHISPER_MODEL", "large-v3-turbo")
+    device = os.getenv("WHISPER_DEVICE", "cpu")
+    compute_type = os.getenv("WHISPER_COMPUTE_TYPE", "int8")
+
+    print(f"모델 로딩: {model_name} / device={device} / compute_type={compute_type}")
+
+    return WhisperModel(
+        model_name,
+        device=device,
+        compute_type=compute_type,
+    )
 
 
-def transcribe_with_progress(model: WhisperModel, mp4_file: Path):
+def transcribe_with_progress(
+    model: WhisperModel,
+    mp4_file: Path,
+    progress: Progress,
+    task_id: int,
+):
     total_duration = get_media_duration_seconds(mp4_file)
+
+    progress.update(
+        task_id,
+        total=total_duration if total_duration > 0 else 100,
+        completed=0,
+        filename=mp4_file.name,
+        status="처리중",
+    )
 
     segments_generator, info = model.transcribe(
         str(mp4_file),
         language="ko",
         vad_filter=True,
+        vad_parameters=dict(min_silence_duration_ms=500),
         beam_size=5,
+        best_of=5,
+        condition_on_previous_text=True,
+        word_timestamps=False,
+        temperature=0.0,
     )
 
     collected_segments = []
-    last_printed_percent = -1
-    start_time = time.time()
-
-    print(f"총 길이: {total_duration:.1f}초 ({format_seconds(total_duration)})")
 
     for seg in segments_generator:
         collected_segments.append(seg)
-
         processed_audio = max(0.0, min(seg.end, total_duration))
 
-        if total_duration > 0:
-            percent = min(int((processed_audio / total_duration) * 100), 100)
-        else:
-            percent = 0
+        progress.update(
+            task_id,
+            completed=processed_audio,
+            status="처리중",
+        )
 
-        if percent != last_printed_percent:
-            elapsed = time.time() - start_time
-
-            # 오디오 처리 속도(배속): 예) 2.5x = 1초 처리에 실제 0.4초
-            speed = (processed_audio / elapsed) if elapsed > 0 else 0.0
-
-            remaining_audio = max(total_duration - processed_audio, 0.0)
-            eta = (remaining_audio / speed) if speed > 0 else 0.0
-
-            bar = build_progress_bar(percent, width=30)
-
-            print(
-                f"\r[{bar}] {percent:3d}% | "
-                f"{format_seconds(processed_audio)} / {format_seconds(total_duration)} | "
-                f"경과 {format_seconds(elapsed)} | "
-                f"ETA {format_seconds(eta)} | "
-                f"{speed:.2f}x",
-                end="",
-                flush=True,
-            )
-            last_printed_percent = percent
-
-    total_elapsed = time.time() - start_time
-    print(
-        f"\r[{'█' * 30}] 100% | "
-        f"{format_seconds(total_duration)} / {format_seconds(total_duration)} | "
-        f"총 {format_seconds(total_elapsed)}"
+    progress.update(
+        task_id,
+        completed=total_duration,
+        status="저장중",
     )
 
     return collected_segments, info
@@ -137,36 +215,86 @@ def main() -> None:
     output_dir = Path("subtitles")
     output_dir.mkdir(exist_ok=True)
 
-    model = WhisperModel(
-        "small",
-        device="cpu",
-        compute_type="int8",
-    )
+    if not input_dir.exists():
+        print("downloads 폴더가 없습니다.")
+        return
 
     mp4_files = sorted(input_dir.glob("*.mp4"))
     if not mp4_files:
         print("MP4 파일이 없습니다.")
         return
 
-    total_files = len(mp4_files)
+    try:
+        model = build_model()
+    except Exception as e:
+        print(f"모델 로딩 실패: {e}")
+        return
 
-    for idx, mp4_file in enumerate(mp4_files, start=1):
-        print(f"\n[{idx}/{total_files}] 처리중: {mp4_file.name}")
+    console = Console()
 
+    progress = Progress(
+        TextColumn("[bold blue]{task.fields[filename]}", justify="left"),
+        BarColumn(bar_width=30),
+        TaskProgressColumn(),
+        TextColumn("{task.completed:.0f}/{task.total:.0f}초"),
+        TimeElapsedColumn(),
+        TimeRemainingColumn(),
+        TextColumn("{task.fields[status]}"),
+        console=console,
+        transient=False,
+    )
+
+    task_map: dict[Path, int] = {}
+
+    for mp4_file in mp4_files:
+        duration = 100.0
         try:
-            segments, info = transcribe_with_progress(model, mp4_file)
+            duration = get_media_duration_seconds(mp4_file)
+        except Exception:
+            pass
 
-            srt_path = output_dir / f"{mp4_file.stem}.srt"
-            txt_path = output_dir / f"{mp4_file.stem}.txt"
+        task_id = progress.add_task(
+            "transcribe",
+            total=duration if duration > 0 else 100,
+            completed=0,
+            filename=mp4_file.name,
+            status="대기중",
+        )
+        task_map[mp4_file] = task_id
 
-            write_srt(segments, srt_path)
-            write_txt(segments, txt_path)
+    with progress:
+        for mp4_file in mp4_files:
+            task_id = task_map[mp4_file]
 
-            print(f"완료: {srt_path.name}, {txt_path.name}")
-            print(f"감지 언어: {info.language} / 확률: {info.language_probability:.3f}")
+            try:
+                progress.update(task_id, status="시작")
 
-        except Exception as e:
-            print(f"\n오류: {mp4_file.name} -> {e}")
+                segments, info = transcribe_with_progress(
+                    model=model,
+                    mp4_file=mp4_file,
+                    progress=progress,
+                    task_id=task_id,
+                )
+
+                srt_path = output_dir / f"{mp4_file.stem}.srt"
+                txt_path = output_dir / f"{mp4_file.stem}.txt"
+
+                write_srt(segments, srt_path)
+                write_txt(segments, txt_path)
+
+                progress.update(
+                    task_id,
+                    completed=progress.tasks[task_id].total,
+                    status=f"완료 ({info.language}/{info.language_probability:.3f})",
+                )
+
+            except subprocess.CalledProcessError as e:
+                progress.update(task_id, status="ffprobe 오류")
+                console.print(f"[red]{mp4_file.name} ffprobe 오류:[/red] {e}")
+
+            except Exception as e:
+                progress.update(task_id, status=f"오류: {type(e).__name__}")
+                console.print(f"[red]{mp4_file.name} 실패:[/red] {e}")
 
 
 if __name__ == "__main__":
