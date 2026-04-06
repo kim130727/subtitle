@@ -5,6 +5,7 @@ import os
 import re
 import subprocess
 from pathlib import Path
+from typing import Iterable
 
 from dotenv import load_dotenv
 from faster_whisper import WhisperModel
@@ -20,7 +21,7 @@ from rich.progress import (
 
 load_dotenv()
 
-# Hugging Face 관련 경고 완화
+# Hugging Face 심볼릭 링크 경고 완화
 os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
 
 
@@ -61,7 +62,7 @@ def should_skip_segment(text: str, duration: float) -> bool:
     return False
 
 
-def merge_lines_for_txt(segments) -> list[str]:
+def merge_lines_for_txt(segments: Iterable) -> list[str]:
     lines: list[str] = []
     buffer = ""
 
@@ -95,7 +96,7 @@ def merge_lines_for_txt(segments) -> list[str]:
     if buffer:
         lines.append(buffer)
 
-    cleaned_lines = []
+    cleaned_lines: list[str] = []
     for line in lines:
         line = normalize_text(line)
         if line:
@@ -104,7 +105,7 @@ def merge_lines_for_txt(segments) -> list[str]:
     return cleaned_lines
 
 
-def write_srt(segments, output_path: Path) -> None:
+def write_srt(segments: Iterable, output_path: Path) -> None:
     with output_path.open("w", encoding="utf-8-sig") as f:
         srt_index = 1
         for seg in segments:
@@ -120,7 +121,7 @@ def write_srt(segments, output_path: Path) -> None:
             srt_index += 1
 
 
-def write_txt(segments, output_path: Path) -> None:
+def write_txt(segments: Iterable, output_path: Path) -> None:
     lines = merge_lines_for_txt(segments)
     with output_path.open("w", encoding="utf-8-sig") as f:
         for line in lines:
@@ -130,9 +131,12 @@ def write_txt(segments, output_path: Path) -> None:
 def get_media_duration_seconds(file_path: Path) -> float:
     cmd = [
         "ffprobe",
-        "-v", "error",
-        "-show_entries", "format=duration",
-        "-of", "json",
+        "-v",
+        "error",
+        "-show_entries",
+        "format=duration",
+        "-of",
+        "json",
         str(file_path),
     ]
     result = subprocess.run(
