@@ -6,12 +6,6 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 
-def sanitize_filename(name: str) -> str:
-    name = re.sub(r'[\\/:*?"<>|]+', '_', name)
-    name = re.sub(r'\s+', ' ', name).strip()
-    return name[:180] or 'video'
-
-
 def video_id_from_url(url: str) -> str:
     parsed = urlparse(url)
     if parsed.netloc.endswith('youtu.be'):
@@ -22,8 +16,6 @@ def video_id_from_url(url: str) -> str:
 
 def vtt_to_text(vtt_path: Path) -> str:
     s = vtt_path.read_text(encoding='utf-8', errors='ignore')
-
-    # Strip header/timestamps/tags and compact repeated lines.
     s = re.sub(r'^WEBVTT.*$', '', s, flags=re.MULTILINE)
     s = re.sub(r'^\d+$', '', s, flags=re.MULTILINE)
     s = re.sub(
@@ -35,13 +27,11 @@ def vtt_to_text(vtt_path: Path) -> str:
     s = re.sub(r'<[^>]+>', '', s)
 
     lines = [ln.strip() for ln in s.splitlines() if ln.strip()]
-
-    cleaned = []
+    dedup = []
     for ln in lines:
-        if not cleaned or cleaned[-1] != ln:
-            cleaned.append(ln)
-
-    return '\n'.join(cleaned)
+        if not dedup or dedup[-1] != ln:
+            dedup.append(ln)
+    return '\n'.join(dedup)
 
 
 def run_yt_dlp(url: str, out_dir: Path, lang_pattern: str, cookies_file: str | None) -> int:
@@ -61,7 +51,7 @@ def run_yt_dlp(url: str, out_dir: Path, lang_pattern: str, cookies_file: str | N
     ]
     if cookies_file:
         cmd[1:1] = ['--cookies', cookies_file]
-    p = subprocess.run(cmd, check=False)
+    p = subprocess.run(cmd, check=False, capture_output=True, text=True)
     return p.returncode
 
 
@@ -111,109 +101,132 @@ def cleanup_vtt_for_video(out_dir: Path, vid: str) -> None:
             p.unlink(missing_ok=True)
 
 
-def process_url(
+def to_txt(vtt_path: Path) -> Path:
+    text = vtt_to_text(vtt_path)
+
+    stem = vtt_path.stem
+    for suffix in ('.ko-orig', '.ko', '.en-orig', '.en', '.live_chat'):
+        if stem.endswith(suffix):
+            stem = stem[: -len(suffix)]
+            break
+
+    txt_path = vtt_path.with_name(f'{stem}.txt')
+    txt_path.write_text(text, encoding='utf-8')
+    return txt_path
+
+
+def extract_one(
     url: str,
     out_dir: Path,
     retries: int,
     retry_delay: float,
     cookies_file: str | None,
-) -> tuple[str, Path | None, Path | None]:
+) -> tuple[bool, str, str]:
     vid = video_id_from_url(url)
 
-    # Try Korean first, then English fallback.
     run_yt_dlp_with_retry(url, out_dir, 'ko.*', retries, retry_delay, cookies_file)
     run_yt_dlp_with_retry(url, out_dir, 'en.*', retries, retry_delay, cookies_file)
 
-    vtt_files = sorted(out_dir.glob('*.vtt'))
-    target_vtt = choose_vtt_for_video(vtt_files, vid)
-    if target_vtt is None:
-        return vid, None, None
+    vtt = choose_vtt_for_video(sorted(out_dir.glob('*.vtt')), vid)
+    if vtt is None:
+        return False, vid, 'subtitle not found (private/unavailable/no caption/429 possible)'
 
-    text = vtt_to_text(target_vtt)
-
-    stem = target_vtt.stem
-    if stem.endswith('.ko-orig'):
-        stem = stem[: -len('.ko-orig')]
-    elif stem.endswith('.ko'):
-        stem = stem[: -len('.ko')]
-    elif stem.endswith('.en-orig'):
-        stem = stem[: -len('.en-orig')]
-    elif stem.endswith('.en'):
-        stem = stem[: -len('.en')]
-
-    txt_path = target_vtt.with_name(f'{sanitize_filename(stem)}.txt')
-    txt_path.write_text(text, encoding='utf-8')
+    txt_path = to_txt(vtt)
     cleanup_vtt_for_video(out_dir, vid)
-    return vid, target_vtt, txt_path
+    return True, vid, txt_path.name
+
+
+def load_urls(path: Path) -> list[str]:
+    urls = []
+    for line in path.read_text(encoding='utf-8').splitlines():
+        url = line.strip()
+        if not url or url.startswith('#'):
+            continue
+        urls.append(url)
+    return urls
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description='Extract YouTube subtitles and save cleaned transcript text files.'
-    )
-    parser.add_argument('urls', nargs='+', help='One or more YouTube video URLs')
-    parser.add_argument('--out-dir', default='subs', help='Output directory (default: subs)')
-    parser.add_argument(
-        '--between-delay',
-        type=float,
-        default=0.0,
-        help='Delay seconds between videos to reduce rate limits (default: 0)',
-    )
-    parser.add_argument(
-        '--retries',
-        type=int,
-        default=0,
-        help='Retry count per language download (default: 0)',
-    )
-    parser.add_argument(
-        '--retry-delay',
-        type=float,
-        default=3.0,
-        help='Delay seconds between retries (default: 3)',
-    )
-    parser.add_argument(
+    p = argparse.ArgumentParser(description='Extract transcript txt files from a URL list.')
+    p.add_argument('--url-file', default='channel_UCOwc__o7u25JDCfqCHK5qaQ_urls.txt')
+    p.add_argument('--out-dir', default='subs')
+    p.add_argument('--between-delay', type=float, default=2.0)
+    p.add_argument('--retries', type=int, default=1)
+    p.add_argument('--retry-delay', type=float, default=4.0)
+    p.add_argument('--report-file', default='subs/extract_report.txt')
+    p.add_argument(
         '--cookies-file',
         default=None,
         help='Path to cookies.txt for private/unlisted/age-restricted videos',
     )
-    return parser.parse_args()
+    return p.parse_args()
 
 
 def main() -> int:
     args = parse_args()
+
+    url_file = Path(args.url_file)
     out_dir = Path(args.out_dir)
+    report_file = Path(args.report_file)
+
     out_dir.mkdir(parents=True, exist_ok=True)
+    report_file.parent.mkdir(parents=True, exist_ok=True)
 
-    print(f'Output directory: {out_dir.resolve()}')
+    urls = load_urls(url_file)
+    total = len(urls)
+    if total == 0:
+        print(f'No URLs found in {url_file}')
+        return 1
 
-    ok = 0
+    success = 0
     failed = 0
+    failures: list[tuple[str, str, str]] = []
 
-    for url in args.urls:
-        print(f'\nProcessing: {url}')
-        vid, vtt_path, txt_path = process_url(
-            url,
-            out_dir,
+    print(f'Start: {total} urls')
+    start = time.time()
+
+    for i, url in enumerate(urls, start=1):
+        print(f'[{i}/{total}] processing {url}')
+        ok, vid, msg = extract_one(
+            url=url,
+            out_dir=out_dir,
             retries=max(args.retries, 0),
             retry_delay=max(args.retry_delay, 0.0),
             cookies_file=args.cookies_file,
         )
 
-        if vtt_path and txt_path:
-            ok += 1
-            print(f'  video id: {vid}')
-            print(f'  subtitle: {vtt_path.name}')
-            print(f'  transcript: {txt_path.name}')
+        if ok:
+            success += 1
+            print(f'  OK    id={vid} -> {msg}')
         else:
             failed += 1
-            print(f'  video id: {vid}')
-            print('  subtitle: not found (no ko/en subtitle track available)')
+            failures.append((url, vid, msg))
+            print(f'  FAIL  id={vid} -> {msg}')
 
         if args.between_delay > 0:
             time.sleep(args.between_delay)
 
-    print(f'\nDone. success={ok}, failed={failed}')
-    return 0 if failed == 0 else 1
+        print(f'  Progress: success={success}, failed={failed}')
+
+    elapsed = time.time() - start
+    lines = [
+        f'total={total}',
+        f'success={success}',
+        f'failed={failed}',
+        f'elapsed_sec={elapsed:.1f}',
+        '',
+        '[failed items]',
+    ]
+    for url, vid, reason in failures:
+        lines.append(f'{vid}\t{url}\t{reason}')
+
+    report_file.write_text('\n'.join(lines), encoding='utf-8')
+
+    print('\nDone')
+    print(f'  total={total}, success={success}, failed={failed}, elapsed={elapsed:.1f}s')
+    print(f'  report={report_file.resolve()}')
+
+    return 0
 
 
 if __name__ == '__main__':
